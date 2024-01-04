@@ -1,0 +1,9 @@
+
+text.txt
+Main.spec
+dist/Main
+build/Main/Main.pkg
+Main.spec
+*.toc
+*.pyc
+*.html

@@ -1,0 +1,207 @@
+import asyncio
+from bleak import BleakScanner, BleakClient
+import uuid
+import struct
+import numpy as np
+from scipy.interpolate import interp1d
+import matplotlib.pyplot as plt
+# ^ anyone running this needs to pip install all these packages if they don't have them already
+
+PM5UUID = {
+    'strokedata': uuid.UUID('{ce060035-43e5-11e4-916c-0800200c9a66}'),
+    'dataadditional': uuid.UUID('{ce060033-43e5-11e4-916c-0800200c9a66}'),
+    'strokecurve': uuid.UUID('{ce06003D-43e5-11e4-916c-0800200c9a66}')
+}
+
+# Holds the relevant data for a single stroke curve
+characteristic_data = []
+all_strokes = []
+
+# The application
+fig = plt.figure(figsize=(5, 4), dpi=100)
+ax = fig.add_subplot(1, 1, 1)
+
+# Initialize lines
+line_stroke, = ax.plot([], label='Stroke Force Curve')
+line_ideal, = ax.plot([], label='Ideal Force Curve', linestyle='--')
+line_average, = ax.plot([], label='Average User Stroke Force Curve', linestyle='--')
+
+# Declare isCurveBefore as a global variable
+global isCurveBefore
+isCurveBefore = False
+
+async def notification_handler(sender, data: bytearray):
+    global characteristic_data, isCurveBefore  # Use the global variables
+    print(f"Received Notification from {sender} :Length: {len(data)}")
+    # Check characteristic UUID to determine what kind of packet it is. Can't do straight matching as sender.uuid is a special type of obj.
+    # Regular Stroke Data:
+    if str(sender.uuid).lower() == str(PM5UUID['strokedata']).lower():
+        if len(data) == 20:
+            decoded_data = struct.unpack('<HHHBBHHHBBHH', data)
+            print("Decoded Stroke Data:", decoded_data)
+            if isCurveBefore:
+                finalizedStrokeData()
+    # Additioanl Stroke Data:
+    elif str(sender.uuid).lower() == str(PM5UUID['dataadditional']).lower():
+        if len(data) == 15:
+            decoded_data = struct.unpack('<HHHBBHHHB', data)
+            print("Decoded Additional Stroke Data:", decoded_data)
+            if isCurveBefore:
+                finalizedStrokeData()
+    # Stroke packet data.
+    else:
+        # Handle stroke curve data
+        isCurveBefore = True
+        handle_stroke_curve_data(data)
+
+def handle_stroke_curve_data(data: bytearray):
+    global characteristic_data  # Use the global variable
+    # Append received data to the array
+    characteristic_data.extend(data)
+
+# Gets called when all stroke data is received (ie other packets may come. Thankful for in-order packet sending!)
+def finalizedStrokeData():
+    global characteristic_data, isCurveBefore  # Use the global variables
+    decoded_curve_data = struct.unpack('<' + 'H' * (len(characteristic_data) // 2), bytes(characteristic_data))
+
+    # Calculate mean and standard deviation to filter out
+    mean_value = np.mean(decoded_curve_data)
+    std_dev = np.std(decoded_curve_data)
+
+    # Threshold for removing outliers in standard deviations.
+    threshold = 1 * std_dev
+
+    # Remove elements that are more than the threshold away from their preceding and succeeding nodes
+    filtered_curve_data = [decoded_curve_data[i] for i in range(1, len(decoded_curve_data)-1)
+                           if abs(decoded_curve_data[i] - decoded_curve_data[i-1]) < threshold
+                           and abs(decoded_curve_data[i] - decoded_curve_data[i+1]) < threshold]
+
+    # Plotting output
+    print("Decoded Complete Stroke Curve Data (Unfiltered):", decoded_curve_data) # In case anyone wants to see the random maxes.
+    print("Decoded Complete Stroke Curve Data (Filtered):", filtered_curve_data) # Removed all outliers.
+
+    # Adding to total based on 100 data points.
+    filtered_normalized = normalize_force_curve(filtered_curve_data)
+    all_strokes.append(filtered_normalized)
+
+    #Plotting the filtered normalized curve
+    plot_force_curve(filtered_normalized)
+
+    # Resetting characteristic data and prepping for new set of curves.
+    characteristic_data = []
+    isCurveBefore = False
+
+# Normalizes the curve to store for the average curve data.
+def normalize_force_curve(force_curve, num_points=100):
+    # Using Numpy
+    force_curve = np.array(force_curve)
+    
+    # Create an interpolation function for the force curve
+    interp_func = interp1d(np.linspace(0, 1, len(force_curve)), force_curve, kind='linear', fill_value="extrapolate")
+    
+    # Resample the force curve to the specified number of points
+    resampled_curve = interp_func(np.linspace(0, 1, num_points))
+    
+    # Calculate the minimum and maximum values in the resampled curve
+    min_value = np.min(resampled_curve)
+    max_value = np.max(resampled_curve)
+    
+    # Perform Min-Max normalization
+    normalized_curve = 100 * (resampled_curve - min_value) / (max_value - min_value)
+    
+    return normalized_curve
+
+def get_average_stroke():
+    # Ensure there are strokes to calculate the average
+    if not all_strokes:
+        print("No strokes available to calculate the average.")
+        return None
+
+    # Calculate the average curve across all strokes
+    num_data_points = len(all_strokes[0])  # Assuming all strokes have the same number of data points
+    num_strokes = len(all_strokes)
+
+    # Initialize a list to store the sum of each corresponding data point
+    sum_curve = [0] * num_data_points
+
+    # Sum up each corresponding data point across all strokes
+    for stroke in all_strokes:
+        sum_curve = [sum_val + data_point for sum_val, data_point in zip(sum_curve, stroke)]
+
+    # Calculate the average by dividing each sum by the number of strokes
+    average_curve = [sum_val / num_strokes for sum_val in sum_curve]
+
+    return average_curve
+
+
+async def enable_notifications(client, characteristic_uuid):
+    # Enable notifications for the specified characteristic
+    await client.start_notify(characteristic_uuid, notification_handler)
+
+# Number of words in the force curve
+num_words = 14
+
+# Plotting the force curve to the graph.
+def plot_force_curve(words):
+    global line_stroke, line_ideal, line_average  # Add global lines for updating
+
+    # Coefficients for the ideal stroke, normalized to about 0-100.
+    # coefficients = [-0.000181016, -0.00501883, 1.96259, 35.3926] # For a starting point of ~35
+    coefficients = [-0.00012696, -0.016442, 2.66442, 25.1661]  # For a starting point of ~25
+
+    # Generate x values for the polynomial curve
+    x_values = np.linspace(0, 100, len(words))  # Assuming x values range from 0 to 1
+    poly_curve = np.polyval(coefficients, x_values)
+
+    # The stroke force curve
+    line_stroke.set_data(range(len(words)), words)
+
+    # The ideal force curve.
+    line_ideal.set_data(range(len(poly_curve)), poly_curve)
+
+    # The average user force curve
+    if all_strokes:
+        line_average.set_data(range(len(get_average_stroke())), get_average_stroke())
+
+    # Adjust plot limits if needed
+    ax.relim()
+    ax.autoscale_view()
+
+    # Draw the updated plot
+    plt.draw()
+    plt.pause(0.0001)  # Small delay to update plot.
+
+
+async def discover_and_connect_to_pm5():
+    devices = await BleakScanner.discover(20)
+    pm5_device = next((device for device in devices if device.name and "PM5" in device.name), None)
+
+    if pm5_device:
+        print(f"Found PM5: {pm5_device.name} ({pm5_device.address})")
+        async with BleakClient(pm5_device.address) as client:
+            # Connect to the PM5 device
+            await client.connect()
+
+            # Enable notifications for 'strokedata' characteristic
+            await enable_notifications(client, PM5UUID['strokedata'])
+
+            # Enable notifications for 'strokedataadditional' characteristic
+            await enable_notifications(client, PM5UUID['dataadditional'])
+
+            # Enable notifications for 'strokecurve' characteristic
+            await enable_notifications(client, PM5UUID['strokecurve'])
+
+            # Keep the program running
+            await asyncio.Future()
+
+def startProgram():
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(discover_and_connect_to_pm5())
+
+if __name__ == "__main__":
+    print("************************************")
+    print('To start program, make sure that BlueTooth is enabled for Terminal / whatever you are running this .exe on. ')
+    print('Turn on your PM5 BlueTooth (More Options -> Turn Wireless ON). This will timeout if it is not discovered in 20 seconds.')
+    print('You will see that the connection is successful on the PM5 interface. At that point, start rowing.')
+    print("************************************")
+    startProgram()
